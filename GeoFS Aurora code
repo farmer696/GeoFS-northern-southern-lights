@@ -3,7 +3,7 @@
 // @namespace    https://github.com/seabus0316
 // @version      0.3.0
 // @description  Northern / southern lights for GeoFS, placed where the aurora is actually happening (NOAA OVATION live data). Toggle with the UI or Alt+A.
-// @author       Twinkieavaition
+// @author       Twinkieavaition 
 // @match        http://*/geofs.php*
 // @match        https://*/geofs.php*
 // @grant        none
