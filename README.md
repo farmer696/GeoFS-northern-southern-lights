@@ -1,5 +1,9 @@
-I though it would be cool to have a northern lights addon for GeoFS and i didnt find any and didnt find anyone making one, so i made my own.
+I though it would be cool to have a northern lights addon for GeoFS and i didnt find any and didnt find anyone making one, so i made my own...
+
+
 GeoFS Aurora is a userscript for Tampermonkey (or any userscript manager) that adds northern and southern lights to GeoFS. In its default mode it puts the aurora where it is actually happening on Earth right now. You can also switch to a custom mode and build your own shape. 
+
+
 What you see
 The aurora is drawn as tall, glowing curtains in the night sky, floating 100 km up. The tops reach 230–450 km in live mode, depending on how active the aurora is.
 Colour by altitude: the bottom edge has a thin pink fringe and is sharp and bright. Above it is a green body (the classic aurora colour), with violet and a faint red tint toward the top.
@@ -14,6 +18,8 @@ Where you’ll see it: if you’re near the oval, for example over northern Cana
 Fallback: if GeoFS blocks the NOAA request, it uses a rough estimate of the oval (about Kp 3). The panel says “Estimated oval” when that happens.
 Night only
 The aurora fades in as the sun drops between 4° and 12° below your horizon and is hidden in daylight. This uses the Cesium clock. If GeoFS doesn’t drive that clock, the sun check may not match the in-game time, so I haven’t confirmed this works. The Show in daylight option overrides it.
+
+
 Custom mode (Live unticked)
 Custom mode ignores real data and places a shape of your choice relative to you.
 Shapes: curtain, arc, ring, spiral, wave.
@@ -22,6 +28,8 @@ Distance: 80–800 km.
 Size: 0.3×–3×.
 Height: 200–500 km.
 Layers: 1–3.
+
+
 Controls
 Bottom-bar button: a moon icon that opens a popover.
 Bonsai settings: a section is added if you use Bonsai UI.
