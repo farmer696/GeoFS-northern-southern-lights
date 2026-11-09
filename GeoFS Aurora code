@@ -1,0 +1,891 @@
+// ==UserScript==
+// @name         GeoFS Aurora
+// @namespace    https://github.com/seabus0316
+// @version      0.3.0
+// @description  Northern / southern lights for GeoFS, placed where the aurora is actually happening (NOAA OVATION live data). Toggle with the UI or Alt+A.
+// @author       Twinkieavaition
+// @match        http://*/geofs.php*
+// @match        https://*/geofs.php*
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // Re-injection safety: tear down any previous instance first.
+  if (window.GeoFSAurora && typeof window.GeoFSAurora.destroy === 'function') {
+    try { window.GeoFSAurora.destroy(); } catch (e) { /* ignore */ }
+  }
+
+  const TAG = '[GeoFSAurora]';
+  const CFG = {
+    intensity: 0.9,        // 0.1 - 1.5, overall brightness
+    live: true,            // true: place curtains from real NOAA data; false: demo curtains north/south of you
+    ignoreDaylight: false, // show even when the sun is up
+    dataUrl: 'https://services.swpc.noaa.gov/json/ovation_aurora_latest.json',
+    refreshMs: 10 * 60 * 1000, // NOAA publishes a new nowcast about every 5 min
+    fallbackKp: 3,         // used for the estimated oval if NOAA can't be reached
+    minProb: 6,            // OVATION value (0-100) below which a spot is treated as "no aurora"
+    rayMinKm: 60,          // live mode: closest / farthest distance searched around the camera
+    rayMaxKm: 1100,
+    maxRuns: 4,            // max separate curtain sections drawn
+    bottomKm: 100,         // curtain base altitude
+    layerShiftDeg: 0.5,    // second layer is shifted this far poleward
+    rebuildKm: 60,         // rebuild curtains after the camera moved this far
+    // custom (non-live) mode
+    shape: 'curtain',      // curtain | arc | ring | spiral | wave
+    dir: 'poleward',       // poleward | north | east | south | west | look
+    demoDistKm: 300,       // distance to the shape
+    size: 1,               // scales the shape (length / span / radius)
+    demoLengthKm: 1800,    // base length of curtain & wave at size 1
+    demoTopKm: 380,        // height of the tops
+    demoLayers: 3,
+    demoSpacingKm: 90,
+    sunFadeStart: -4,      // deg sun elevation: begin showing
+    sunFadeEnd: -12        // deg sun elevation: fully visible
+  };
+
+  const S = {
+    enabled: false,
+    destroyed: false,
+    viewer: null,
+    scene: null,
+    prims: [],
+    anchor: null,
+    builtVersion: -1,
+    builtLive: null,
+    removeListener: null,
+    t0: 0,
+    grid: null,            // Float32Array 181 x 360, [lat+90][lon]
+    gridSrc: '',           // 'noaa' | 'estimate'
+    forecastTime: '',
+    dataVersion: 0,
+    fetching: false,
+    dataTimer: null,
+    info: { curtains: 0, nearestKm: null, peak: 0 },
+    uiInterval: null,
+    uiTimer: null,
+    pollTimer: null,
+    uidn: 0,
+    docClick: null,
+    keyHandler: null,
+    fallbackAllowed: false,
+    panel: null,
+    btnToggle: null,
+    matSerial: 0
+  };
+
+  const log = (...a) => console.log(TAG, ...a);
+  const warn = (...a) => console.warn(TAG, ...a);
+
+  // ---------- helpers ----------
+  const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+  const smooth = (e0, e1, x) => { const t = clamp((x - e0) / (e1 - e0), 0, 1); return t * t * (3 - 2 * t); };
+  const toDeg = r => r * 180 / Math.PI;
+  const toRad = d => d * Math.PI / 180;
+  const rnd = (a, b) => a + Math.random() * (b - a);
+  const R_EARTH = 6371; // km
+
+  function requestRender() {
+    try { S.scene.requestRender && S.scene.requestRender(); } catch (e) { /* ignore */ }
+  }
+
+  function cameraLatDeg() {
+    return toDeg(Cesium.Cartographic.fromCartesian(S.viewer.camera.positionWC).latitude);
+  }
+
+  function sunElevationDeg() {
+    const time = S.viewer.clock.currentTime;
+    const sun = Cesium.Simon1994PlanetaryPositions.computeSunPositionInEarthInertialFrame(time, new Cesium.Cartesian3());
+    let m = Cesium.Transforms.computeIcrfToFixedMatrix(time, new Cesium.Matrix3());
+    if (!m) m = Cesium.Transforms.computeTemeToPseudoFixedMatrix(time, new Cesium.Matrix3());
+    const f = Cesium.Matrix3.multiplyByVector(m, sun, new Cesium.Cartesian3());
+    Cesium.Cartesian3.normalize(f, f);
+    const up = Cesium.Cartesian3.normalize(S.viewer.camera.positionWC, new Cesium.Cartesian3());
+    return toDeg(Math.asin(clamp(Cesium.Cartesian3.dot(f, up), -1, 1)));
+  }
+
+  function nightFactor() {
+    if (CFG.ignoreDaylight) return 1;
+    try { return smooth(CFG.sunFadeStart, CFG.sunFadeEnd, sunElevationDeg()); }
+    catch (err) { return 1; } // if the sun can't be computed, don't hide the aurora
+  }
+
+  function probe() {
+    const r = {};
+    const t = (name, fn) => { try { r[name] = fn(); } catch (e) { r[name] = 'ERR: ' + e.message; } };
+    t('Cesium.VERSION', () => window.Cesium && Cesium.VERSION);
+    t('geofs.api.viewer', () => !!geofs.api.viewer);
+    t('WallGeometry', () => typeof Cesium.WallGeometry);
+    t('sun elevation (deg)', () => sunElevationDeg());
+    t('night factor', () => nightFactor());
+    t('camera lat (deg)', () => cameraLatDeg());
+    t('data source', () => S.gridSrc || 'none yet');
+    t('forecast time', () => S.forecastTime);
+    t('grid value at camera', () => {
+      const c = Cesium.Cartographic.fromCartesian(S.viewer.camera.positionWC);
+      return gridVal(toDeg(c.latitude), toDeg(c.longitude));
+    });
+    t('live info', () => JSON.stringify(S.info));
+    console.table(r);
+    return r;
+  }
+
+  // ---------- real-world aurora data (NOAA SWPC OVATION nowcast) ----------
+  // Format: {"Forecast Time": ..., "coordinates": [[lon 0..359, lat -90..90, value 0..100], ...]}, geographic coords.
+  function gridVal(latDeg, lonDeg) {
+    const g = S.grid;
+    if (!g) return 0;
+    const la = clamp(latDeg, -90, 90) + 90;
+    const lo = ((lonDeg % 360) + 360) % 360;
+    const i0 = Math.min(180, Math.floor(la)), i1 = Math.min(180, i0 + 1);
+    const j0 = Math.floor(lo) % 360, j1 = (j0 + 1) % 360;
+    const fa = la - i0, fo = lo - Math.floor(lo);
+    const a = g[i0 * 360 + j0] * (1 - fo) + g[i0 * 360 + j1] * fo;
+    const b = g[i1 * 360 + j0] * (1 - fo) + g[i1 * 360 + j1] * fo;
+    return a * (1 - fa) + b * fa;
+  }
+
+  // Rough dipole-model auroral oval, used only when NOAA can't be reached.
+  function fallbackGrid() {
+    const g = new Float32Array(181 * 360);
+    const poles = [{ lat: 80.8, lon: -72.7 }, { lat: -80.8, lon: 107.3 }];
+    const center = 68 - 1.4 * CFG.fallbackKp; // geomagnetic latitude of the oval centre
+    for (let la = -90; la <= 90; la++) {
+      const pole = la >= 0 ? poles[0] : poles[1];
+      const sp = Math.sin(toRad(pole.lat)), cp = Math.cos(toRad(pole.lat));
+      const sl = Math.sin(toRad(la)), cl = Math.cos(toRad(la));
+      for (let lo = 0; lo < 360; lo++) {
+        const ang = toDeg(Math.acos(clamp(sl * sp + cl * cp * Math.cos(toRad(lo - pole.lon)), -1, 1)));
+        const mlat = 90 - ang;
+        const z = (mlat - center) / 3.5;
+        g[(la + 90) * 360 + lo] = 55 * Math.exp(-z * z);
+      }
+    }
+    return g;
+  }
+
+  async function fetchData() {
+    if (S.fetching || S.destroyed) return;
+    S.fetching = true;
+    try {
+      const r = await fetch(CFG.dataUrl, { cache: 'no-store' });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const j = await r.json();
+      const coords = j && j.coordinates;
+      if (!Array.isArray(coords) || coords.length < 1000) throw new Error('unexpected data format');
+      const g = new Float32Array(181 * 360);
+      for (let k = 0; k < coords.length; k++) {
+        const c = coords[k];
+        const lon = c[0] | 0, lat = c[1] | 0;
+        if (lon < 0 || lon > 359 || lat < -90 || lat > 90) continue;
+        g[(lat + 90) * 360 + lon] = c[2];
+      }
+      S.grid = g;
+      S.gridSrc = 'noaa';
+      S.forecastTime = String(j['Forecast Time'] || '');
+      S.dataVersion++;
+      log('NOAA OVATION data loaded, forecast time', S.forecastTime);
+    } catch (e) {
+      warn('could not load NOAA data (' + (e && e.message) + ')');
+      if (S.gridSrc !== 'noaa') { // keep older real data if we have it
+        S.grid = fallbackGrid();
+        S.gridSrc = 'estimate';
+        S.dataVersion++;
+      }
+    } finally {
+      S.fetching = false;
+      syncControls();
+    }
+  }
+
+  // ---------- curtain placement ----------
+  // Live: look around the camera, find where the oval is within range, follow its ridge.
+  function liveSpecs() {
+    const c = Cesium.Cartographic.fromCartesian(S.viewer.camera.positionWC);
+    const lat0 = c.latitude, lon0 = c.longitude;
+    const sinP = Math.sin(lat0), cosP = Math.cos(lat0);
+    const nAz = 120;
+    const ray = [];
+    let peak = 0;
+
+    for (let a = 0; a < nAz; a++) {
+      const th = a * 2 * Math.PI / nAz, cth = Math.cos(th), sth = Math.sin(th);
+      let best = -1, bd = 0;
+      for (let d = CFG.rayMinKm; d <= CFG.rayMaxKm; d += 20) {
+        const dl = d / R_EARTH, sd = Math.sin(dl), cd = Math.cos(dl);
+        const lat = Math.asin(clamp(sinP * cd + cosP * sd * cth, -1, 1));
+        const lon = lon0 + Math.atan2(sth * sd * cosP, cd - sinP * Math.sin(lat));
+        const v = gridVal(toDeg(lat), toDeg(lon));
+        if (v > best) { best = v; bd = d; }
+      }
+      ray.push({ v: best, d: bd, th: th });
+      if (best > peak) peak = best;
+    }
+
+    // smooth ridge distance / strength with a circular 3-tap filter over valid neighbours
+    const valid = i => ray[(i + nAz) % nAz].v >= CFG.minProb;
+    const sm = ray.map(function (r, i) {
+      if (!valid(i)) return { v: r.v, d: r.d, th: r.th };
+      let sv = r.v * 2, sd = r.d * 2, w = 2;
+      [-1, 1].forEach(function (o) {
+        if (valid(i + o)) { const n = ray[(i + o + nAz) % nAz]; sv += n.v; sd += n.d; w += 1; }
+      });
+      return { v: sv / w, d: sd / w, th: r.th };
+    });
+
+    // split into contiguous runs
+    let start = 0, allValid = true;
+    for (let i = 0; i < nAz; i++) if (!valid(i)) { start = (i + 1) % nAz; allValid = false; break; }
+    const runs = [];
+    let cur = [];
+    for (let k = 0; k < nAz; k++) {
+      const i = (start + k) % nAz;
+      const r = sm[i];
+      const ok = valid(i) && (!cur.length || Math.abs(r.d - cur[cur.length - 1].d) <= 350);
+      if (ok) {
+        cur.push(r);
+      } else {
+        if (cur.length) runs.push(cur);
+        cur = valid(i) ? [r] : [];
+      }
+    }
+    if (cur.length) runs.push(cur);
+
+    const good = runs.filter(r => r.length >= 4).map(function (r) {
+      const meanV = r.reduce((s, p) => s + p.v, 0) / r.length;
+      return { pts: r, meanV: meanV, score: meanV * r.length };
+    }).sort((a, b) => b.score - a.score).slice(0, CFG.maxRuns);
+
+    const specs = [];
+    let nearest = null;
+    good.forEach(function (run, ri) {
+      const lvl = smooth(6, 60, run.meanV);
+      const ll = run.pts.map(function (p) {
+        if (nearest === null || p.d < nearest) nearest = p.d;
+        const dl = p.d / R_EARTH, sd = Math.sin(dl), cd = Math.cos(dl);
+        const lat = Math.asin(clamp(sinP * cd + cosP * sd * Math.cos(p.th), -1, 1));
+        const lon = lon0 + Math.atan2(Math.sin(p.th) * sd * cosP, cd - sinP * Math.sin(lat));
+        return [lat, lon];
+      });
+      const hemi = (ll.reduce((s, p) => s + p[0], 0) / ll.length) >= 0 ? 1 : -1;
+      const top = 230 + 220 * lvl;
+      for (let layer = 0; layer < 2; layer++) {
+        const shift = toRad(CFG.layerShiftDeg) * layer * hemi;
+        const coords = [];
+        ll.forEach(function (p) {
+          coords.push(Cesium.Math.convertLongitudeRange(p[1]),
+                      clamp(p[0] + shift, toRad(-85), toRad(85)));
+        });
+        specs.push({ coords: coords, level: layer ? lvl * 0.7 : lvl, topKm: layer ? top * 0.85 : top,
+                     seed: 1.3 + ri * 4.1 + layer * 2.7 + Math.random() });
+      }
+    });
+    S.info = { curtains: good.length, nearestKm: nearest === null ? null : Math.round(nearest), peak: Math.round(peak) };
+    void allValid;
+    return specs;
+  }
+
+  // Custom (non-live) mode: a shape of your choice, placed relative to the camera.
+  const SHAPES = { curtain: 'Curtain', arc: 'Arc', ring: 'Ring', spiral: 'Spiral', wave: 'Wave' };
+  const DIRS = { poleward: 'Poleward', north: 'North', east: 'East', south: 'South', west: 'West', look: "Where I'm looking" };
+
+  function demoBearing(hemi) {
+    switch (CFG.dir) {
+      case 'north': return 0;
+      case 'east': return Math.PI / 2;
+      case 'south': return Math.PI;
+      case 'west': return 1.5 * Math.PI;
+      case 'look': return S.viewer.camera.heading || 0;
+      default: return hemi >= 0 ? 0 : Math.PI;
+    }
+  }
+
+  // Points in km on a local flat map: +n = forward (chosen direction), +e = right. Camera is the origin.
+  function shapePoints(shape, D, k, phase) {
+    const pts = [];
+    if (shape === 'arc') {
+      const span = toRad(clamp(75 * k, 20, 175));
+      const N = 96;
+      for (let i = 0; i < N; i++) {
+        const f = (i / (N - 1)) * 2 - 1, a = f * span;
+        const r = D * (1 + 0.04 * Math.sin(f * 6 + phase));
+        pts.push([r * Math.sin(a), r * Math.cos(a)]);
+      }
+    } else if (shape === 'ring') {
+      const N = 120;
+      for (let i = 0; i < N; i++) {
+        const a = (i / N) * 2 * Math.PI;
+        const r = D * (1 + 0.05 * Math.sin(3 * a + phase));
+        pts.push([r * Math.sin(a), r * Math.cos(a)]);
+      }
+    } else if (shape === 'spiral') {
+      const N = 140, turns = 2.2, R0 = 250 * k;
+      for (let i = 0; i < N; i++) {
+        const f = i / (N - 1), a = f * turns * 2 * Math.PI + phase;
+        const r = R0 * (0.15 + 0.85 * f);
+        pts.push([r * Math.sin(a), D + r * Math.cos(a)]);
+      }
+    } else { // curtain or wave: a long east-west sheet across the chosen direction
+      const wave = shape === 'wave';
+      const half = (CFG.demoLengthKm / 2) * k * (wave ? 0.7 : 1);
+      const N = 128;
+      const freq = wave ? 4 : 2.5;
+      const amp = wave ? 160 * k : 25;
+      for (let i = 0; i < N; i++) {
+        const f = (i / (N - 1)) * 2 - 1;
+        pts.push([f * half, D + amp * Math.sin(f * freq * Math.PI * 0.5 + phase)]);
+      }
+    }
+    return pts;
+  }
+
+  function demoSpecs() {
+    const c = Cesium.Cartographic.fromCartesian(S.viewer.camera.positionWC);
+    const lat0 = c.latitude, lon0 = c.longitude;
+    const sinP = Math.sin(lat0), cosP = Math.cos(lat0);
+    const th0 = demoBearing(lat0 >= 0 ? 1 : -1);
+    const ct = Math.cos(th0), st = Math.sin(th0);
+    const layers = clamp(CFG.demoLayers | 0, 1, 3);
+    const phase = Math.random() * 6.28;
+    const specs = [];
+    for (let layer = 0; layer < layers; layer++) {
+      const Dl = CFG.demoDistKm + layer * CFG.demoSpacingKm;
+      const pts = shapePoints(CFG.shape, Dl, CFG.size, phase);
+      const coords = [];
+      pts.forEach(function (p) {
+        const east = p[0] * ct + p[1] * st;
+        const north = -p[0] * st + p[1] * ct;
+        const d = Math.max(5, Math.hypot(east, north));
+        const brg = Math.atan2(east, north);
+        const dl = d / R_EARTH, sd = Math.sin(dl), cd = Math.cos(dl);
+        const lat = Math.asin(clamp(sinP * cd + cosP * sd * Math.cos(brg), -1, 1));
+        const lon = lon0 + Math.atan2(Math.sin(brg) * sd * cosP, cd - sinP * Math.sin(lat));
+        coords.push(Cesium.Math.convertLongitudeRange(lon), clamp(lat, toRad(-85), toRad(85)));
+      });
+      specs.push({ coords: coords, level: 0.8, topKm: CFG.demoTopKm - layer * 30,
+                   seed: 1.7 + layer * 3.31 + Math.random() * 2 });
+    }
+    S.info = { curtains: specs.length, nearestKm: Math.round(CFG.demoDistKm), peak: 0 };
+    return specs;
+  }
+
+  // ---------- shader ----------
+  const FRAG = `
+    uniform float time;
+    uniform float intensity;
+    uniform float seed;
+    uniform float len;
+    uniform float hgt;
+    uniform float fade;
+
+    float gh(float n) { return fract(sin(n * 127.1 + seed * 17.3) * 43758.5453); }
+    float vn(float x) {
+      float i = floor(x);
+      float f = fract(x);
+      f = f * f * (3.0 - 2.0 * f);
+      return mix(gh(i), gh(i + 1.0), f);
+    }
+    float fbm(float x) {
+      return vn(x) * 0.55 + vn(x * 2.03 + 7.1) * 0.30 + vn(x * 4.1 + 3.3) * 0.15;
+    }
+
+    czm_material czm_getMaterial(czm_materialInput materialInput) {
+      czm_material m = czm_getDefaultMaterial(materialInput);
+      float s = materialInput.st.s;
+      float t = materialInput.st.t;
+      float x = s * len / 1000.0;     // km along the curtain
+      float hk = t * hgt;             // km above the curtain base
+
+      // the curtain folds back and forth, giving broad bright and dark bands
+      float warp = fbm(x * 0.05 + time * 0.03) * 6.0;
+      float pleat = 0.5 + 0.5 * sin(x * 0.22 + warp + time * 0.12);
+      pleat = pow(pleat, 1.5);
+
+      // fine vertical rays drifting along the curtain
+      float ray = smoothstep(0.2, 0.85, fbm(x * 1.1 + warp * 0.8 + time * 0.25));
+      float ray2 = vn(x * 3.3 - time * 0.45 + warp);
+      float rays = (0.25 + 0.75 * ray) * (0.65 + 0.35 * ray2);
+
+      // each ray reaches a different height: sharp bright lower edge, long fade upward
+      float reach = mix(35.0, 140.0, ray);
+      float body = exp(-hk / reach);
+      float edge = exp(-hk / 6.0);
+      float prof = smoothstep(0.0, 4.0, hk) * (body * 0.8 + edge * 0.7);
+
+      // colour by altitude: pink fringe, green body, violet and faint red on top
+      vec3 col = mix(vec3(0.95, 0.30, 0.55), vec3(0.10, 1.00, 0.42), smoothstep(0.0, 12.0, hk));
+      col = mix(col, vec3(0.55, 0.22, 0.92), smoothstep(70.0, 170.0, hk));
+      col = mix(col, vec3(0.90, 0.12, 0.25), smoothstep(170.0, 300.0, hk) * 0.5);
+
+      float taper = smoothstep(0.0, 0.12, s) * smoothstep(0.0, 0.12, 1.0 - s);
+      float pulse = 0.85 + 0.15 * sin(time * 0.4 + seed * 2.0) + 0.05 * sin(time * 2.3 + x);
+
+      float a = prof * rays * (0.3 + 0.7 * pleat) * taper * pulse * intensity * fade * 1.1;
+      m.diffuse = col;
+      m.alpha = clamp(a, 0.0, 1.0);
+      return m;
+    }
+  `;
+
+  function makeMaterial(seed, lenM, hgtKm) {
+    const type = 'GeoFSAurora_' + Date.now() + '_' + (++S.matSerial);
+    return new Cesium.Material({
+      fabric: {
+        type: type,
+        uniforms: { time: 0.0, intensity: CFG.intensity, seed: seed, len: lenM, hgt: hgtKm, fade: 0.0 },
+        source: FRAG
+      },
+      translucent: true
+    });
+  }
+
+  function createWall(spec) {
+    const n = spec.coords.length / 2;
+    const minH = [], maxH = [];
+    for (let i = 0; i < n; i++) {
+      const f = (i / (n - 1)) * 2 - 1;
+      const jb = 1 + 0.08 * Math.sin(f * 7 + spec.seed);
+      const jt = 1 + 0.12 * Math.sin(f * 4.3 + spec.seed * 2);
+      minH.push(CFG.bottomKm * 1000 * jb);
+      maxH.push((CFG.bottomKm + (spec.topKm - CFG.bottomKm) * jt) * 1000);
+    }
+    const positions = Cesium.Cartesian3.fromRadiansArray(spec.coords);
+    let total = 0;
+    for (let i = 1; i < positions.length; i++) total += Cesium.Cartesian3.distance(positions[i - 1], positions[i]);
+
+    const geometry = new Cesium.WallGeometry({
+      positions: positions,
+      minimumHeights: minH,
+      maximumHeights: maxH,
+      vertexFormat: Cesium.MaterialAppearance.MaterialSupport.TEXTURED.vertexFormat
+    });
+    const mat = makeMaterial(spec.seed, total, spec.topKm - CFG.bottomKm);
+    const appearance = new Cesium.MaterialAppearance({
+      material: mat,
+      materialSupport: Cesium.MaterialAppearance.MaterialSupport.TEXTURED,
+      flat: true,
+      translucent: true,
+      faceForward: false,
+      closed: false,
+      renderState: {
+        depthTest: { enabled: true },
+        depthMask: false,
+        cull: { enabled: false },
+        blending: Cesium.BlendingState.ADDITIVE_BLEND
+      }
+    });
+    const prim = S.scene.primitives.add(new Cesium.Primitive({
+      geometryInstances: new Cesium.GeometryInstance({ geometry: geometry }),
+      appearance: appearance,
+      asynchronous: false,
+      allowPicking: false,
+      releaseGeometryInstances: true
+    }));
+    prim.show = false;
+    S.prims.push({ prim: prim, mat: mat, level: spec.level });
+  }
+
+  function clearCurtains() {
+    S.prims.forEach(function (p) {
+      try { S.scene.primitives.remove(p.prim); } catch (e) { warn('remove prim', e); }
+    });
+    S.prims = [];
+  }
+
+  function buildCurtains() {
+    clearCurtains();
+    S.anchor = Cesium.Cartesian3.clone(S.viewer.camera.positionWC);
+    S.builtVersion = S.dataVersion;
+    S.builtLive = CFG.live;
+    let specs = [];
+    if (CFG.live) {
+      if (S.grid) specs = liveSpecs();
+      else S.info = { curtains: 0, nearestKm: null, peak: 0 };
+    } else {
+      specs = demoSpecs();
+    }
+    specs.forEach(function (sp) {
+      try { createWall(sp); } catch (e) { warn('createWall failed', e); }
+    });
+    syncControls();
+  }
+
+  // ---------- per-frame update ----------
+  function onFrame() {
+    if (!S.enabled || S.destroyed) return;
+    try {
+      const cam = S.viewer.camera;
+      const moved = !S.anchor || Cesium.Cartesian3.distance(cam.positionWC, S.anchor) > CFG.rebuildKm * 1000;
+      if (moved || S.builtVersion !== S.dataVersion || S.builtLive !== CFG.live) buildCurtains();
+
+      const factor = nightFactor();
+      const t = (performance.now() - S.t0) / 1000;
+      const show = factor > 0.01;
+      S.prims.forEach(function (p) {
+        p.prim.show = show;
+        if (!show) return;
+        p.mat.uniforms.time = t;
+        p.mat.uniforms.intensity = CFG.intensity * (0.35 + 0.65 * p.level);
+        p.mat.uniforms.fade = factor;
+      });
+    } catch (e) { warn('frame error', e); }
+    requestRender(); // requestRenderMode is on in GeoFS, keep animating
+  }
+
+  // ---------- enable / disable ----------
+  function enable() {
+    if (S.enabled || S.destroyed) return;
+    if (!S.viewer) { warn('viewer not ready'); return; }
+    S.enabled = true;
+    S.t0 = performance.now();
+    S.builtVersion = -1;
+    fetchData();
+    S.dataTimer = setInterval(fetchData, CFG.refreshMs);
+    S.removeListener = S.scene.preRender.addEventListener(onFrame);
+    savePrefs();
+    updatePanel();
+    requestRender();
+    log('enabled');
+  }
+
+  function disable() {
+    if (!S.enabled) return;
+    S.enabled = false;
+    if (S.removeListener) { try { S.removeListener(); } catch (e) {} S.removeListener = null; }
+    if (S.dataTimer) { clearInterval(S.dataTimer); S.dataTimer = null; }
+    clearCurtains();
+    S.anchor = null;
+    savePrefs();
+    updatePanel();
+    requestRender();
+    log('disabled');
+  }
+
+  function toggle() { S.enabled ? disable() : enable(); }
+
+  function rebuild() {
+    if (S.enabled) { S.builtVersion = -1; requestRender(); }
+  }
+
+  // ---------- persisted prefs ----------
+  const PREF_KEY = 'geofsAuroraSettings_v2';
+  const PREFS = { enabled: false, intensity: CFG.intensity, live: true, ignoreDaylight: false,
+                  shape: CFG.shape, dir: CFG.dir, dist: CFG.demoDistKm, size: CFG.size, height: CFG.demoTopKm, layers: CFG.demoLayers };
+
+  function loadPrefs() {
+    try {
+      const r = JSON.parse(localStorage.getItem(PREF_KEY) || 'null');
+      if (!r) return;
+      if (typeof r.enabled === 'boolean') PREFS.enabled = r.enabled;
+      if (typeof r.live === 'boolean') PREFS.live = r.live;
+      if (typeof r.ignoreDaylight === 'boolean') PREFS.ignoreDaylight = r.ignoreDaylight;
+      if (typeof r.intensity === 'number' && isFinite(r.intensity)) PREFS.intensity = clamp(r.intensity, 0.1, 1.5);
+      if (typeof r.shape === 'string' && SHAPES[r.shape]) PREFS.shape = r.shape;
+      if (typeof r.dir === 'string' && DIRS[r.dir]) PREFS.dir = r.dir;
+      const num = (v, a, b, d) => (typeof v === 'number' && isFinite(v)) ? clamp(v, a, b) : d;
+      PREFS.dist = num(r.dist, 80, 800, PREFS.dist);
+      PREFS.size = num(r.size, 0.3, 3, PREFS.size);
+      PREFS.height = num(r.height, 200, 500, PREFS.height);
+      PREFS.layers = Math.round(num(r.layers, 1, 3, PREFS.layers));
+    } catch (e) { /* ignore */ }
+  }
+
+  function savePrefs() {
+    if (S.destroyed) return;
+    PREFS.enabled = S.enabled;
+    PREFS.intensity = CFG.intensity;
+    PREFS.live = CFG.live;
+    PREFS.ignoreDaylight = CFG.ignoreDaylight;
+    PREFS.shape = CFG.shape; PREFS.dir = CFG.dir; PREFS.dist = CFG.demoDistKm;
+    PREFS.size = CFG.size; PREFS.height = CFG.demoTopKm; PREFS.layers = CFG.demoLayers;
+    try { localStorage.setItem(PREF_KEY, JSON.stringify(PREFS)); } catch (e) { /* ignore */ }
+  }
+
+  // ---------- UI ----------
+  const SECTION_ID = 'na-section';
+  const POP_ID = 'na-popover';
+  const BTN_ID = 'na-bar-btn';
+  const STYLE_ID = 'na-style';
+
+  function optionList(map) {
+    return Object.keys(map).map(k => '<option value="' + k + '">' + map[k] + '</option>').join('');
+  }
+  function sliderRow(key, label, min, max, step) {
+    return '<div class="row"><label>' + label + '</label>' +
+      '<input type="range" data-na="' + key + '" min="' + min + '" max="' + max + '" step="' + step + '">' +
+      '<span data-na="' + key + 'Val" style="width:58px;text-align:right"></span></div>';
+  }
+
+  function makeControls(titleTag) {
+    const uid = ++S.uidn;
+    const sec = document.createElement('div');
+    sec.setAttribute('data-na-controls', '1');
+    sec.innerHTML =
+      '<' + titleTag + '>AURORA <span style="font-weight:normal;color:#888">(Alt+A)</span></' + titleTag + '>' +
+      '<div class="row"><label for="na-enable-' + uid + '">Aurora effect</label>' +
+        '<input type="checkbox" data-na="enable" id="na-enable-' + uid + '"></div>' +
+      '<div class="row"><label for="na-live-' + uid + '">Live (real aurora location)</label>' +
+        '<input type="checkbox" data-na="live" id="na-live-' + uid + '"></div>' +
+      '<div class="row"><label for="na-day-' + uid + '">Show in daylight</label>' +
+        '<input type="checkbox" data-na="day" id="na-day-' + uid + '"></div>' +
+      '<div data-na="shapebox">' +
+        '<h4>CUSTOM SHAPE</h4>' +
+        '<div class="row"><label>Shape</label><select data-na="shape">' + optionList(SHAPES) + '</select></div>' +
+        '<div class="row"><label>Direction</label><select data-na="dir">' + optionList(DIRS) + '</select></div>' +
+        sliderRow('dist', 'Distance', 80, 800, 10) +
+        sliderRow('size', 'Size', 0.3, 3, 0.1) +
+        sliderRow('height', 'Height', 200, 500, 10) +
+        sliderRow('layers', 'Layers', 1, 3, 1) +
+      '</div>' +
+      '<h4>BRIGHTNESS</h4>' +
+      '<div class="row"><input type="range" data-na="bright" min="0.1" max="1.5" step="0.05">' +
+        '<span data-na="brightVal"></span></div>' +
+      '<div class="row" style="display:block"><div data-na="status1" style="color:#888;font-size:10px"></div>' +
+        '<div data-na="status2" style="color:#888;font-size:10px;margin-top:2px"></div></div>';
+
+    const q = k => sec.querySelector('[data-na="' + k + '"]');
+    const en = q('enable'), lv = q('live'), da = q('day'), br = q('bright');
+    en.addEventListener('change', () => { en.checked ? enable() : disable(); });
+    lv.addEventListener('change', () => { CFG.live = lv.checked; savePrefs(); syncControls(); requestRender(); });
+    da.addEventListener('change', () => { CFG.ignoreDaylight = da.checked; savePrefs(); syncControls(); requestRender(); });
+    br.addEventListener('input', () => { CFG.intensity = parseFloat(br.value); savePrefs(); syncControls(); requestRender(); });
+
+    const applyShape = () => { savePrefs(); rebuild(); syncControls(); };
+    q('shape').addEventListener('change', () => { CFG.shape = q('shape').value; applyShape(); });
+    q('dir').addEventListener('change', () => { CFG.dir = q('dir').value; applyShape(); });
+    [['dist', 'demoDistKm'], ['size', 'size'], ['height', 'demoTopKm'], ['layers', 'demoLayers']].forEach(function (pair) {
+      const el = q(pair[0]);
+      el.addEventListener('input', () => { CFG[pair[1]] = parseFloat(el.value); syncControls(); });
+      el.addEventListener('change', () => { CFG[pair[1]] = parseFloat(el.value); applyShape(); });
+    });
+    return sec;
+  }
+
+  function statusLines() {
+    if (!S.enabled) return ['', ''];
+    let l1, l2;
+    if (!CFG.live) {
+      l1 = 'Custom: ' + SHAPES[CFG.shape] + ', ' + DIRS[CFG.dir].toLowerCase();
+      l2 = '';
+    } else {
+      if (!S.grid) l1 = 'Loading aurora data...';
+      else if (S.gridSrc === 'noaa') {
+        const m = /T(\d\d:\d\d)/.exec(S.forecastTime);
+        l1 = 'NOAA OVATION nowcast' + (m ? ' (' + m[1] + 'Z)' : '');
+      } else l1 = 'Estimated oval (NOAA unreachable)';
+      if (S.grid) {
+        l2 = S.info.curtains > 0
+          ? 'In range: ' + S.info.curtains + ' curtain(s), nearest ~' + S.info.nearestKm + ' km'
+          : 'No aurora within ~' + CFG.rayMaxKm + ' km of you right now';
+      } else l2 = '';
+    }
+    try {
+      if (nightFactor() < 0.01) l2 += (l2 ? ' - ' : '') + 'sun is up';
+    } catch (e) { /* ignore */ }
+    return [l1, l2];
+  }
+
+  function syncControls() {
+    const st = statusLines();
+    document.querySelectorAll('[data-na-controls]').forEach(function (sec) {
+      const q = k => sec.querySelector('[data-na="' + k + '"]');
+      q('enable').checked = S.enabled;
+      q('live').checked = CFG.live;
+      q('day').checked = CFG.ignoreDaylight;
+      q('bright').value = CFG.intensity;
+      q('brightVal').textContent = Math.round(CFG.intensity * 100) + '%';
+      q('shapebox').style.display = CFG.live ? 'none' : 'block';
+      q('shape').value = CFG.shape;
+      q('dir').value = CFG.dir;
+      q('dist').value = CFG.demoDistKm;   q('distVal').textContent = Math.round(CFG.demoDistKm) + ' km';
+      q('size').value = CFG.size;         q('sizeVal').textContent = CFG.size.toFixed(1) + 'x';
+      q('height').value = CFG.demoTopKm;  q('heightVal').textContent = Math.round(CFG.demoTopKm) + ' km';
+      q('layers').value = CFG.demoLayers; q('layersVal').textContent = String(CFG.demoLayers);
+      q('status1').textContent = st[0];
+      q('status2').textContent = st[1];
+    });
+    const btn = document.getElementById(BTN_ID);
+    if (btn) btn.classList.toggle('geofs-toggled', S.enabled);
+  }
+
+  function injectBonsai() {
+    const host = document.getElementById('bonsai-settings');
+    if (!host) return false;
+    if (document.getElementById(SECTION_ID)) return true;
+    const wrap = document.createElement('div');
+    wrap.id = SECTION_ID;
+    wrap.appendChild(makeControls('h4'));
+    host.insertBefore(wrap, host.querySelector('#bs-reset') || null);
+    return true;
+  }
+
+  function ensureStyle() {
+    if (document.getElementById(STYLE_ID)) return;
+    const st = document.createElement('style');
+    st.id = STYLE_ID;
+    st.textContent = `
+      #na-popover{position:fixed;left:50%;bottom:54px;transform:translateX(-50%);z-index:2147483646;
+        width:300px;display:none;background:rgba(0,0,0,.82);border:1px solid rgba(255,255,255,.25);
+        border-radius:6px;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);color:#fff;
+        font:12px 'Consolas','Menlo',monospace;padding:12px 14px;pointer-events:auto}
+      #na-popover h3{font-size:12px;letter-spacing:3px;margin:0 0 8px;color:#ccc;
+        border-bottom:1px solid rgba(255,255,255,.15);padding-bottom:6px}
+      #na-popover h4{font-size:10px;letter-spacing:2px;margin:10px 0 6px;color:#888}
+      #na-popover .row{display:flex;align-items:center;justify-content:space-between;padding:4px 0}
+      #na-popover .row label{flex:1;cursor:pointer}
+      #na-popover input[type=checkbox]{accent-color:#fff;cursor:pointer}
+      #na-popover input[type=range]{width:130px}
+      #na-popover select{background:#222;color:#fff;border:1px solid rgba(255,255,255,.25);font:inherit;padding:2px 4px;border-radius:3px}
+    `;
+    document.head.appendChild(st);
+  }
+
+  function injectOfficial() {
+    const bar = document.querySelector('.geofs-ui-bottom');
+    if (!bar) return false;
+    if (document.getElementById(BTN_ID) && bar.contains(document.getElementById(BTN_ID))) return true;
+
+    const old = document.getElementById(BTN_ID);
+    if (old && old.parentNode) old.parentNode.removeChild(old);
+    ensureStyle();
+
+    const btn = document.createElement('button');
+    btn.id = BTN_ID;
+    btn.className = 'mdl-button mdl-button--icon';
+    btn.title = 'Aurora';
+    btn.innerHTML = '<i class="material-icons">nights_stay</i>';
+    bar.appendChild(btn);
+
+    let pop = document.getElementById(POP_ID);
+    if (!pop) {
+      pop = document.createElement('div');
+      pop.id = POP_ID;
+      pop.appendChild(makeControls('h3'));
+      document.body.appendChild(pop);
+    }
+    btn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      pop.style.display = (pop.style.display === 'block') ? 'none' : 'block';
+      btn.blur();
+      syncControls();
+    });
+    if (!S.docClick) {
+      S.docClick = function (e) {
+        const pp = document.getElementById(POP_ID);
+        const bb = document.getElementById(BTN_ID);
+        if (!pp || pp.style.display !== 'block') return;
+        if (pp.contains(e.target) || (bb && bb.contains(e.target))) return;
+        pp.style.display = 'none';
+      };
+      document.addEventListener('click', S.docClick, true);
+    }
+    syncControls();
+    return true;
+  }
+
+  function decideUI() {
+    if (S.destroyed || !S.panel) return;
+    const b = injectBonsai();
+    const o = injectOfficial();
+    if (b || o) S.panel.style.display = 'none';
+    else if (S.fallbackAllowed) S.panel.style.display = 'flex';
+    syncControls();
+  }
+
+  function buildPanel() {
+    const p = document.createElement('div');
+    p.id = 'geofs-aurora-panel';
+    p.style.cssText =
+      'position:fixed;left:8px;bottom:44px;z-index:9999;display:none;gap:6px;' +
+      'font:12px sans-serif;background:rgba(0,0,0,.55);padding:4px 6px;border-radius:6px;';
+    const b = document.createElement('button');
+    b.style.cssText = 'cursor:pointer;border:0;border-radius:4px;padding:3px 8px;';
+    b.addEventListener('click', toggle);
+    p.appendChild(b);
+    S.btnToggle = b;
+    document.body.appendChild(p);
+    S.panel = p;
+    updatePanel();
+  }
+
+  function updatePanel() {
+    if (S.panel && S.btnToggle) {
+      S.btnToggle.textContent = S.enabled ? '🌌 Aurora: on' : '🌌 Aurora: off';
+    }
+    syncControls();
+  }
+
+  // ---------- lifecycle ----------
+  function destroy() {
+    S.destroyed = true;
+    if (S.pollTimer) { clearInterval(S.pollTimer); S.pollTimer = null; }
+    if (S.uiTimer) { clearTimeout(S.uiTimer); S.uiTimer = null; }
+    if (S.uiInterval) { clearInterval(S.uiInterval); S.uiInterval = null; }
+    if (S.docClick) { document.removeEventListener('click', S.docClick, true); S.docClick = null; }
+    if (S.keyHandler) { document.removeEventListener('keydown', S.keyHandler, true); S.keyHandler = null; }
+    disable();
+    [SECTION_ID, BTN_ID, POP_ID, STYLE_ID].forEach(function (id) {
+      const el = document.getElementById(id);
+      if (el && el.parentNode) el.parentNode.removeChild(el);
+    });
+    if (S.panel && S.panel.parentNode) S.panel.parentNode.removeChild(S.panel);
+    S.panel = null;
+    delete window.GeoFSAurora;
+    log('destroyed');
+  }
+
+  function ready() {
+    return !!(window.Cesium && window.geofs && geofs.api && geofs.api.viewer &&
+              geofs.api.viewer.scene && geofs.api.viewer.camera);
+  }
+
+  function init() {
+    S.viewer = geofs.api.viewer;
+    S.scene = S.viewer.scene;
+
+    loadPrefs();
+    CFG.intensity = PREFS.intensity;
+    CFG.live = PREFS.live;
+    CFG.ignoreDaylight = PREFS.ignoreDaylight;
+    CFG.shape = PREFS.shape; CFG.dir = PREFS.dir; CFG.demoDistKm = PREFS.dist;
+    CFG.size = PREFS.size; CFG.demoTopKm = PREFS.height; CFG.demoLayers = PREFS.layers;
+    const want = { enabled: PREFS.enabled };
+
+    buildPanel();
+    decideUI();
+    S.uiInterval = setInterval(decideUI, 1500);
+    S.uiTimer = setTimeout(function () {
+      S.uiTimer = null;
+      S.fallbackAllowed = true;
+      decideUI();
+    }, 3000);
+
+    // Alt+A toggles the aurora
+    S.keyHandler = function (e) {
+      if (e.altKey && !e.ctrlKey && !e.metaKey && e.code === 'KeyA') {
+        e.preventDefault();
+        toggle();
+      }
+    };
+    document.addEventListener('keydown', S.keyHandler, true);
+
+    if (want.enabled) enable();
+    log('ready. Alt+A toggles. Console: GeoFSAurora.toggle() / .probe() / .destroy()');
+  }
+
+  window.GeoFSAurora = { enable, disable, toggle, rebuild, destroy, probe, cfg: CFG };
+
+  let tries = 0;
+  S.pollTimer = setInterval(function () {
+    if (S.destroyed) return;
+    if (ready()) {
+      clearInterval(S.pollTimer); S.pollTimer = null;
+      try { init(); } catch (e) { warn('init failed', e); }
+    } else if (++tries > 120) {
+      clearInterval(S.pollTimer); S.pollTimer = null;
+      warn('GeoFS viewer not available after 60 s; run GeoFSAurora.probe()');
+    }
+  }, 500);
+})();
