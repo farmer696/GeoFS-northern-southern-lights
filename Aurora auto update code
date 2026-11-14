@@ -1,0 +1,50 @@
+// ==UserScript==
+// @name         GeoFS Aurora (auto-update loader)
+// @namespace    http://tampermonkey.net/
+// @version      1.0
+// @description  Loads the latest GeoFS Aurora (northern/southern lights) from GitHub every time GeoFS loads.
+// @author       You
+// @match        https://www.geo-fs.com/geofs.php*
+// @match        https://beta.geo-fs.com/geofs.php*
+// @match        https://geo-fs.com/geofs.php*
+// @icon         https://www.google.com/s2/favicons?sz=64&domain=geo-fs.com
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const URL = 'https://raw.githubusercontent.com/farmer696/GeoFS-northern-southern-lights/refs/heads/main/GeoFS%20Aurora%20code';
+  const CACHE_KEY = 'geofsAuroraLoaderCache_v1';
+  const SCRIPT_ID = 'geofs-aurora-injected';
+
+  function inject(code, source) {
+    const old = document.getElementById(SCRIPT_ID);
+    if (old && old.parentNode) old.parentNode.removeChild(old);
+    const script = document.createElement('script');
+    script.id = SCRIPT_ID;
+    script.textContent = code;
+    document.head.appendChild(script);
+    console.log('GeoFS Aurora loaded (' + source + ')!');
+  }
+
+  // ?t= makes sure GitHub's raw cache doesn't hand back an old copy
+  fetch(URL + '?t=' + Date.now(), { cache: 'no-store' })
+    .then(function (response) {
+      if (!response.ok) throw new Error('HTTP ' + response.status);
+      return response.text();
+    })
+    .then(function (code) {
+      if (!code || code.indexOf('GeoFSAurora') === -1) throw new Error('unexpected file contents');
+      try { localStorage.setItem(CACHE_KEY, code); } catch (e) { /* ignore */ }
+      inject(code, 'latest from GitHub');
+    })
+    .catch(function (error) {
+      console.error('Failed to load the latest GeoFS Aurora:', error);
+      // offline / GitHub down: fall back to the last copy that loaded fine
+      try {
+        const cached = localStorage.getItem(CACHE_KEY);
+        if (cached) inject(cached, 'cached copy');
+      } catch (e) { /* ignore */ }
+    });
+})();
