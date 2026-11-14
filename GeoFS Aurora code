@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         GeoFS Aurora
 // @namespace    https://github.com/seabus0316
-// @version      0.3.0
-// @description  Northern / southern lights for GeoFS, placed where the aurora is actually happening (NOAA OVATION live data). Toggle with the UI or Alt+A.
-// @author       Twinkieavaition 
+// @version      0.3.2
+// @description  Northern / southern lights for GeoFS, placed where the aurora is actually happening (NOAA OVATION live data) or where ever you want. Toggle with the UI or Alt+A.
+// @author       Twinkieaviation
 // @match        http://*/geofs.php*
 // @match        https://*/geofs.php*
 // @grant        none
@@ -39,7 +39,7 @@
     demoDistKm: 300,       // distance to the shape
     size: 1,               // scales the shape (length / span / radius)
     demoLengthKm: 1800,    // base length of curtain & wave at size 1
-    demoTopKm: 380,        // height of the tops
+    demoTopKm: 520,        // height of the tops
     demoLayers: 3,
     demoSpacingKm: 90,
     sunFadeStart: -4,      // deg sun elevation: begin showing
@@ -270,7 +270,7 @@
         return [lat, lon];
       });
       const hemi = (ll.reduce((s, p) => s + p[0], 0) / ll.length) >= 0 ? 1 : -1;
-      const top = 230 + 220 * lvl;
+      const top = 320 + 300 * lvl;
       for (let layer = 0; layer < 2; layer++) {
         const shift = toRad(CFG.layerShiftDeg) * layer * hemi;
         const coords = [];
@@ -379,6 +379,7 @@
     uniform float len;
     uniform float hgt;
     uniform float fade;
+    uniform float dkm;
 
     float gh(float n) { return fract(sin(n * 127.1 + seed * 17.3) * 43758.5453); }
     float vn(float x) {
@@ -388,7 +389,7 @@
       return mix(gh(i), gh(i + 1.0), f);
     }
     float fbm(float x) {
-      return vn(x) * 0.55 + vn(x * 2.03 + 7.1) * 0.30 + vn(x * 4.1 + 3.3) * 0.15;
+      return vn(x) * 0.65 + vn(x * 2.03 + 7.1) * 0.35;
     }
 
     czm_material czm_getMaterial(czm_materialInput materialInput) {
@@ -398,43 +399,53 @@
       float x = s * len / 1000.0;     // km along the curtain
       float hk = t * hgt;             // km above the curtain base
 
-      // the curtain folds back and forth, giving broad bright and dark bands
-      float warp = fbm(x * 0.05 + time * 0.03) * 6.0;
-      float pleat = 0.5 + 0.5 * sin(x * 0.22 + warp + time * 0.12);
+      // far curtains cover only a few pixels, so soften their fine detail (avoids shimmer / pixel noise)
+      float lod = 1.0 - smoothstep(250.0, 900.0, dkm);
+
+      // broad folds: the curtain bends back and forth, giving bright and dark bands
+      float warp = fbm(x * 0.03 + time * 0.03) * 6.0;
+      float pleat = 0.5 + 0.5 * sin(x * 0.12 + warp + time * 0.12);
       pleat = pow(pleat, 1.5);
 
-      // fine vertical rays drifting along the curtain
-      float ray = smoothstep(0.2, 0.85, fbm(x * 1.1 + warp * 0.8 + time * 0.25));
-      float ray2 = vn(x * 3.3 - time * 0.45 + warp);
-      float rays = (0.25 + 0.75 * ray) * (0.65 + 0.35 * ray2);
+      // vertical rays a few km wide drifting along the curtain
+      float ray = smoothstep(0.15, 0.9, fbm(x * 0.25 + warp * 0.5 + time * 0.2));
+      float ray2 = vn(x * 0.7 - time * 0.35 + warp);
+      float rays = (0.3 + 0.7 * ray) * (0.7 + 0.3 * ray2);
+      rays = mix(0.55, rays, 0.35 + 0.65 * lod);
 
-      // each ray reaches a different height: sharp bright lower edge, long fade upward
-      float reach = mix(35.0, 140.0, ray);
+      // each ray reaches a different height: bright, soft lower edge, long fade upward
+      float reach = mix(55.0, 220.0, ray);
       float body = exp(-hk / reach);
-      float edge = exp(-hk / 6.0);
-      float prof = smoothstep(0.0, 4.0, hk) * (body * 0.8 + edge * 0.7);
+      float edge = exp(-hk / 22.0);
+      // soft fade-in at the base and soft fade-out at the very top, so neither end shows a hard line
+      float bottomFade = smoothstep(0.0, 35.0, hk);
+      float topFade = 1.0 - smoothstep(0.45, 1.0, t);
+      float prof = bottomFade * topFade * (body * 0.8 + edge * 0.6);
 
       // colour by altitude: pink fringe, green body, violet and faint red on top
-      vec3 col = mix(vec3(0.95, 0.30, 0.55), vec3(0.10, 1.00, 0.42), smoothstep(0.0, 12.0, hk));
-      col = mix(col, vec3(0.55, 0.22, 0.92), smoothstep(70.0, 170.0, hk));
-      col = mix(col, vec3(0.90, 0.12, 0.25), smoothstep(170.0, 300.0, hk) * 0.5);
+      vec3 col = mix(vec3(0.95, 0.30, 0.55), vec3(0.10, 1.00, 0.42), smoothstep(0.0, 40.0, hk));
+      col = mix(col, vec3(0.55, 0.22, 0.92), smoothstep(100.0, 260.0, hk));
+      col = mix(col, vec3(0.90, 0.12, 0.25), smoothstep(260.0, 450.0, hk) * 0.5);
 
-      float taper = smoothstep(0.0, 0.12, s) * smoothstep(0.0, 0.12, 1.0 - s);
-      float pulse = 0.85 + 0.15 * sin(time * 0.4 + seed * 2.0) + 0.05 * sin(time * 2.3 + x);
+      float taper = smoothstep(0.0, 0.18, s) * smoothstep(0.0, 0.18, 1.0 - s);
+      float pulse = 0.85 + 0.15 * sin(time * 0.4 + seed * 2.0) + 0.04 * sin(time * 1.7 + x * 0.1);
 
       float a = prof * rays * (0.3 + 0.7 * pleat) * taper * pulse * intensity * fade * 1.1;
+
+      // tiny dither hides colour banding in the soft gradients
+      float dither = (fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) - 0.5) / 255.0;
       m.diffuse = col;
-      m.alpha = clamp(a, 0.0, 1.0);
+      m.alpha = clamp(a + dither * 1.5, 0.0, 1.0);
       return m;
     }
   `;
 
-  function makeMaterial(seed, lenM, hgtKm) {
+  function makeMaterial(seed, lenM, hgtKm, dKm) {
     const type = 'GeoFSAurora_' + Date.now() + '_' + (++S.matSerial);
     return new Cesium.Material({
       fabric: {
         type: type,
-        uniforms: { time: 0.0, intensity: CFG.intensity, seed: seed, len: lenM, hgt: hgtKm, fade: 0.0 },
+        uniforms: { time: 0.0, intensity: CFG.intensity, seed: seed, len: lenM, hgt: hgtKm, fade: 0.0, dkm: dKm },
         source: FRAG
       },
       translucent: true
@@ -461,7 +472,12 @@
       maximumHeights: maxH,
       vertexFormat: Cesium.MaterialAppearance.MaterialSupport.TEXTURED.vertexFormat
     });
-    const mat = makeMaterial(spec.seed, total, spec.topKm - CFG.bottomKm);
+    // average distance from the camera, so the shader can soften far-away detail
+    let dSum = 0, dN = 0;
+    for (let i = 0; i < positions.length; i += 4) {
+      dSum += Cesium.Cartesian3.distance(positions[i], S.viewer.camera.positionWC); dN++;
+    }
+    const mat = makeMaterial(spec.seed, total, spec.topKm - CFG.bottomKm, dN ? dSum / dN / 1000 : 400);
     const appearance = new Cesium.MaterialAppearance({
       material: mat,
       materialSupport: Cesium.MaterialAppearance.MaterialSupport.TEXTURED,
@@ -587,7 +603,7 @@
       const num = (v, a, b, d) => (typeof v === 'number' && isFinite(v)) ? clamp(v, a, b) : d;
       PREFS.dist = num(r.dist, 80, 800, PREFS.dist);
       PREFS.size = num(r.size, 0.3, 3, PREFS.size);
-      PREFS.height = num(r.height, 200, 500, PREFS.height);
+      PREFS.height = (r.height === 380) ? PREFS.height : num(r.height, 250, 800, PREFS.height); // 380 was the old default
       PREFS.layers = Math.round(num(r.layers, 1, 3, PREFS.layers));
     } catch (e) { /* ignore */ }
   }
@@ -636,7 +652,7 @@
         '<div class="row"><label>Direction</label><select data-na="dir">' + optionList(DIRS) + '</select></div>' +
         sliderRow('dist', 'Distance', 80, 800, 10) +
         sliderRow('size', 'Size', 0.3, 3, 0.1) +
-        sliderRow('height', 'Height', 200, 500, 10) +
+        sliderRow('height', 'Height', 250, 800, 10) +
         sliderRow('layers', 'Layers', 1, 3, 1) +
       '</div>' +
       '<h4>BRIGHTNESS</h4>' +
