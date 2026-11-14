@@ -3,7 +3,7 @@
 // @namespace    http://tampermonkey.net/
 // @version      1.0
 // @description  Loads the latest GeoFS Aurora (northern/southern lights) from GitHub every time GeoFS loads.
-// @author       You
+// @author       Twinkieaviation
 // @match        https://www.geo-fs.com/geofs.php*
 // @match        https://beta.geo-fs.com/geofs.php*
 // @match        https://geo-fs.com/geofs.php*
